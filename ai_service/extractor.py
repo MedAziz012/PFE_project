@@ -5,10 +5,12 @@ import json
 import logging
 import os
 import time
+import unicodedata
 from shutil import which
 from pathlib import Path
 from typing import Any
-from PIL import Image, ImageOps, ImageFilter, ImageEnhance, ImageMath
+import numpy as np
+from PIL import Image, ImageOps
 from pytesseract import Output
 
 logger = logging.getLogger(__name__)
@@ -48,22 +50,70 @@ class OrangeExtractor:
 
     # ── Compiled patterns ─────────────────────────────────────────────────────
     FICHE_PERMIT = re.compile(r"\b((?:PC|PA|DP)\d{5,}[A-Z0-9]*)\b", re.I)
+    # Bare ref without prefix — some consultants omit PC/PA/DP on the fiche.
+    # Format: DDD DDD DD X DDDD or DDDDDDDDXDDDD (13 chars after stripping).
+    # Only matched on the "Référence Autorisation Urbanisme" label line.
+    FICHE_PERMIT_BARE = re.compile(
+        r"r[eé]f[eé]rence\s+autorisation\s+urbanisme\s*[:\-]?\s*([0-9][A-Z0-9\s\-/]{10,17})",
+        re.I,
+    )
     FICHE_DLPI   = re.compile(
         r"DATE\s+DE\s+LIVRAISON\s+DU\s+PROJET\s*[:\-]?\s*(\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{4})",
         re.I,
     )
+    # ── Permit ref patterns ──────────────────────────────────────────────────
+    # Primary: strict French format PP DDD DDD DD X DDDD
+    # Suffix first char [A-Z0-9]: accepts digit because OCR misreads letters
+    # as digits — most common: Z→2, B→8, O→0. _clean_permit_ref corrects this.
     AU_PERMIT = re.compile(
-        r"\b((?:P\s*C|P\s*A|D\s*P|C\s*U)[\s\-/]*(?:"
-        r"\d{5}[\s\-/]*\d{2}[\s\-/]*(?:\d{5}|[A-Z0-9]{4,6})(?:[\s\-/]*[A-Z0-9]{2,4})?|"
-        r"\d{3}[\s\-/]*\d{3}[\s\-/]*\d{2}[\s\-/]*[A-Z0-9]{5,6}|"
-        r"(?:\d[\s\-/]*){10,14}[A-Z0-9]{0,4}"
-        r"))\b",
-        re.I,
+        r"(?<![A-Z0-9])"
+        r"((?:PC|PA|DP|CU)"
+        r"[\s\-/]*\d{2,3}"           # dept: 2 or 3 digits
+        r"[\s\-/]*\d{3}"             # commune
+        r"[\s\-/]*\d{2}"             # year
+        r"[\s\-/]*[A-Z0-9]\d{4})"   # suffix: letter OR digit (OCR: Z→2)
+        r"(?![A-Z0-9])",
+        re.IGNORECASE,
     )
     AU_PERMIT_FALLBACK = re.compile(
         r"\b(?:P\s*C|P\s*A|D\s*P|C\s*U)\b(?:[\s\-/]*[A-Z0-9]{2,6}){2,5}",
         re.I,
     )
+
+    # OCR letter↔digit confusion map at suffix position (char 10, 0-indexed)
+    # These letters are systematically misread as digits by Tesseract
+    _OCR_DIGIT_TO_LETTER = {"2": "Z", "8": "B", "0": "O", "1": "I", "6": "G", "5": "S"}
+
+    @classmethod
+    def _clean_permit_ref(cls, raw: str) -> str:
+        """
+        Normalize a raw permit reference to the standard 15-char format.
+
+        Three normalizations:
+        1. Remove non-alphanumeric, uppercase
+        2. Zero-pad 2-digit dept: PC6448324B0041 (14) → PC06448324B0041 (15)
+        3. Truncate OCR noise suffix: PC06448324B0041ST → PC06448324B0041
+        4. Fix OCR digit→letter at suffix position (char index 10):
+           PC03320024 20041 → PC03320024Z0041 (2 was Z misread by OCR)
+
+        WHY position 10?
+        French permit refs: PP(2) + DDD(3) + DDD(3) + DD(2) + X(1) + DDDD(4) = 15
+        Position 10 (0-indexed) is always a LETTER (the type indicator).
+        OCR frequently misreads this letter as a visually similar digit.
+        """
+        clean = re.sub(r"[^A-Z0-9]", "", raw.upper())
+        prefix = clean[:2] if len(clean) >= 2 else ""
+        if prefix in ("PC", "PA", "DP", "CU"):
+            if len(clean) == 14:           # 2-digit dept — zero-pad
+                clean = clean[:2] + "0" + clean[2:]
+            if len(clean) > 15:            # OCR noise — truncate
+                clean = clean[:15]
+            # Fix OCR digit at suffix letter position (index 10)
+            if len(clean) == 15 and clean[10].isdigit():
+                letter = cls._OCR_DIGIT_TO_LETTER.get(clean[10])
+                if letter:
+                    clean = clean[:10] + letter + clean[11:]
+        return clean
 
     # ── Document type keywords ────────────────────────────────────────────────
     # "urbanisme" removed — too generic, matches plan filenames.
@@ -77,7 +127,9 @@ class OrangeExtractor:
     TABLE_COL_KEYWORDS = {
         "adresse":  ["adresse", "voie", "rue", "address"],
         "nb_resid": ["résidentiel", "residentiel", "logts", "logement"],
-        "nb_pro":   ["professionnel", "locaux", "pro"],
+        "nb_pro":   ["professionnel", "locaux", "pro", "cellule", "cellules"],
+        "el_resid": ["el residentiel", "el logement", "el logt"],
+        "el_pro":   ["el pro", "el professionnel", "el locaux", "el cellules"],
         "nb_lots":  ["lot", "lots"],
         "nb_macrolots": ["macrolot", "macrolots"],
     }
@@ -87,16 +139,14 @@ class OrangeExtractor:
     FICHE_COUNT_PATTERNS = {
         "nb_logements_residentiels": [
             r"nb\s*(?:de\s*)?(?:logts?|logements?)\s*(?:r[ée]sidentiels?)?\s*[:=]?\s*(\d+)",
-            r"nb\s*total\s*de\s*logements(?:\s|[/\\]|$|[^\w])+[:=]?\s*(\d+)",
-            r"logements?\s*(?:r[ée]sidentiels?)?\s*[:=]?\s*(\d+)",
-            r"el\s+r[ée]sidentiels?[^a-z]*?(oui|non|0|1|yes|no|\d{1,3})(?:\s|,|\n|$)",
+            r"nb\s*total\s*de\s*logements(?!\s*/\s*locaux?\s*/\s*lots?)(?:\s|[/\\]|$|[^\w])+[:=]?\s*(\d+)",
+            r"logements?(?!\s*/\s*locaux?\s*/\s*lots?)(?:\s*(?:r[ée]sidentiels?)?)?\s*[:=]?\s*(\d+)",
         ],
         "nb_locaux_pros": [
             r"nb\s*(?:de\s*)?(?:locaux?|cellules?)\s*(?:professionnels?|pros?)\s*[:=]?\s*(\d+)",
+            r"nb\s*de\s*cellules?\s*[:=]?\s*(\d+)",
             r"nb\s*total\s*de\s*(?:locaux|cellules)(?:\s|[/\\]|$|[^\w])+[:=]?\s*(\d+)",
-            r"nombre\s+de\s+lots\s*[:=]?\s*(\d+)",
             r"locaux?\s*(?:professionnels?|pros?)?\s*[:=]?\s*(\d+)",
-            r"el\s+pros?[^a-z]*?(oui|non|0|1|yes|no|\d{1,3})(?:\s|,|\n|$)",
         ],
         "nb_lots": [
             r"nb\s*(?:de\s*)?(?:lots?|parcelles?)\s*[:=]?\s*(\d+)",
@@ -125,12 +175,17 @@ class OrangeExtractor:
     )
     # Direct digit extraction with flexible separator: "62 logements, 5 locaux profs"
     FICHE_PAIR_FLEXIBLE = re.compile(
-        r"(\d{1,4})\s*logements?[\s,;:\-]*(?:et|and|and|&|\+|,)\s*(\d{1,4})\s*(?:locaux?|local|cellule|cell)",
+        r"(\d{1,4})\s*logements?[\s,;:\-]*(?:et|and|&|\+|,)\s*(\d{1,4})\s*(?:locaux?|local|cellule|cell)",
+        re.I,
+    )
+    FICHE_NB_CELLULES = re.compile(
+        r"\bnb\s*(?:de\s*)?cellules?\s*[:=]?\s*(\d+)\b",
         re.I,
     )
 
     def __init__(self) -> None:
-        self._tesseract_langs = self._detect_tesseract_languages()
+        # Language is fixed by project requirement: French only.
+        self._ocr_lang = "fra"
 
     # ══════════════════════════════════════════════════════════════════════════
     # PUBLIC API
@@ -139,13 +194,11 @@ class OrangeExtractor:
     def extract(self, pdf_path: str, file_name: str = "") -> dict[str, Any]:
         start  = time.perf_counter()
         # Use a minimal pre-detection base — type-specific fields added below
-        result: dict[str, Any] = dict(self._BASE)
+        result: dict[str, Any] = self._empty_result()
         try:
             text, is_scanned = self._get_text(pdf_path)
-            result["scanned"] = is_scanned
 
             if not text.strip():
-                result["error"] = "No text extracted — blank or corrupt PDF"
                 return result
 
             doc_type = self._detect_type(file_name.lower(), text)
@@ -159,16 +212,17 @@ class OrangeExtractor:
             if   doc_type == "fiche":        result.update(self._extract_fiche(pdf_path, text, is_scanned))
             elif doc_type == "autorisation": result.update(self._extract_autorisation(text))
             elif doc_type == "mandat":       result.update(self._extract_mandat(text))
+            elif doc_type == "unknown":
+                logger.info("Document type could not be classified: %s", file_name)
 
-            if not result.get("error"):
-                result["present"] = True
+            self._post_validate_result(result)
+            result["present"] = any(v is not None for k, v in result.items() if k not in {"document_type", "present"})
 
-            logger.info("Done %.2fs | %s | type=%s | scanned=%s | llm=%s",
+            logger.info("Done %.2fs | %s | type=%s | scanned=%s",
                         time.perf_counter() - start, file_name,
-                        doc_type, is_scanned, result.get("llm_used"))
+                        doc_type, is_scanned)
         except Exception as e:
             logger.exception("Extraction failed: %s", pdf_path)
-            result["error"] = str(e)
         return result
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -177,19 +231,25 @@ class OrangeExtractor:
 
     def _get_text(self, pdf_path: str) -> tuple[str, bool]:
         """Digital PDF → pdfplumber (instant). Scanned → Tesseract OCR."""
-        if Path(pdf_path).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}:
+        if Path(pdf_path).suffix.lower() in {".png", ".jpg", ".jpeg"}:
             with Image.open(pdf_path) as image:
                 return self._ocr_to_string(self._prepare_ocr_image(image)), True
 
         with pdfplumber.open(pdf_path) as pdf:
             pages = list(pdf.pages)
-            digital = "\n--- PAGE ---\n".join(p.extract_text() or "" for p in pages)
-            if len(digital.strip()) >= 50:
+            page_texts = [p.extract_text() or "" for p in pages]
+            digital = "\n--- PAGE ---\n".join(page_texts)
+            pages_with_text = sum(1 for t in page_texts if len(t.strip()) >= 20)
+            if pages_with_text >= 1:
                 return digital, False
 
             logger.info("Scanned PDF detected — running OCR")
+            ocr_config = self._build_ocr_config(psm_default=6)
             pages = [
-                self._ocr_to_string(self._prepare_ocr_image(p.to_image(resolution=200).original))
+                self._ocr_to_string(
+                    self._prepare_ocr_image(p.to_image(resolution=300).original),
+                    config=ocr_config,
+                )
                 for p in pages
             ]
         return "\n--- PAGE ---\n".join(pages), True
@@ -200,86 +260,150 @@ class OrangeExtractor:
 
     def _detect_type(self, file_lower: str, text: str) -> str:
         """
-        Detection priority:
-        1. Compound keyword check for plans (most specific — prevents false matches)
-        2. Single keyword checks ordered specific → generic
-        3. Content fallback (first 1500 chars)
-        4. Default fiche
+        Detection strategy — FILENAME FIRST, content only for ambiguous names.
 
-        WHY compound for plans?
-        "plan" + "situation" or "plan" + "masse" — requiring BOTH words prevents
-        a file like "fiche_plan_projet.pdf" from being misclassified as a plan.
+        WHY filename first?
+        Orange follows a strict naming convention:
+          PFxxxxxxxx_Fiche-de-renseignement_N.pdf
+          PFxxxxxxxx_Autorisation-d-urbanisme_PAR-N-N_N.pdf
+          PFxxxxxxxx_Mandat_N.pdf
+          PFxxxxxxxx_Plan-de-situation_N.pdf / Plan-de-masse_N.pdf
 
-        WHY "urbanisme" removed from autorisation keywords?
-        "autorisation-d-urbanisme" is the correct signal, but "urbanisme" alone
-        appears in plan filenames too ("plan-masse-urbanisme.pdf"). Using only
-        "autorisation" and "permis" is precise enough.
+        The filename is the most reliable signal — it's chosen explicitly.
+        Content detection runs ONLY when the filename gives no clear signal
+        (e.g. "Autre", "document_1", "PAR-3-1").
+
+        WHY the previous content-first approach was wrong:
+        Every fiche contains "Autorisation d'Urbanisme : OUI/NON" and a permit
+        ref code (PC...) in its text. Content-first detection matched these as
+        autorisation markers and returned the wrong type for fiches.
         """
-        # Priority 1 — compound plan checks (most specific)
+        # ── Priority 1: filename compound plan check ──────────────────────────
+        # Plans require BOTH words to avoid "fiche_plan_projet.pdf" → plan
         if "plan" in file_lower and "situation" in file_lower:
             return "plan_situation"
         if "plan" in file_lower and "masse" in file_lower:
             return "plan_masse"
 
-        # Priority 2 — single keyword checks
-        if any(kw in file_lower for kw in self.FICHE_KW):
+        # ── Priority 2: unambiguous filename keywords ─────────────────────────
+        # Each keyword is EXCLUSIVE to one document type in Orange's naming.
+        if "fiche" in file_lower or "renseignement" in file_lower:
             return "fiche"
-        if any(kw in file_lower for kw in self.MANDAT_KW):
+        if "mandat" in file_lower:
             return "mandat"
-        if any(kw in file_lower for kw in self.CERTIFICAT_KW):
+        if "certificat" in file_lower or "adressage" in file_lower:
             return "certificat"
-        if any(kw in file_lower for kw in self.AUTORISATION_KW):
+        if "autorisation" in file_lower or "permis" in file_lower:
             return "autorisation"
 
-        # Priority 3 — content fallback
-        early = text[:1500].lower()
-        if "plan de situation" in early:                          return "plan_situation"
-        if "plan de masse" in early or "plan masse" in early:    return "plan_masse"
-        if re.search(r"\bfiche\b|\brenseignement\b", early): return "fiche"
-        if re.search(r"\bmandat\b", early):                    return "mandat"
-        if re.search(r"\bpermis\b|\barr[êe]t[ée]\b|\bautorisation\b", early):
+        # ── Priority 3: content detection — AMBIGUOUS filenames only ─────────
+        # Reached only for names like "Autre", "document_1", "PAR-3-1".
+        # Uses EXCLUSIVE structural markers — present in ONE type only.
+        # Checked in order: most specific → least specific.
+        t = re.sub(r"\s+", " ", text[:3000]).lower()
+
+        # Plans — check structural phrases unique to plan documents
+        if "plan de situation" in t:
+            return "plan_situation"
+        if "plan de masse" in t or "plan masse" in t:
+            return "plan_masse"
+
+        # Mandat — "mandant" + "mandataire" co-occurring is unique to mandats
+        # A fiche only says "mandat de représentation" — not mandant/mandataire pair
+        if re.search(r"mandant.{0,300}mandataire", t, re.S):
+            return "mandat"
+        if re.search(r"mandat\s+de\s+signature", t):
+            return "mandat"
+
+        # Fiche — Orange-specific headings that NEVER appear in other docs
+        # "FICHE DE RENSEIGNEMENTS" is the clearest possible signal
+        if re.search(r"fiche\s+de\s+renseignements?", t):
+            return "fiche"
+        if re.search(r"date\s+de\s+livraison\s+du\s+projet", t):
+            return "fiche"
+        if re.search(r"ma[iî]tre\s+d.ouvrage\s*/\s*propri[eé]taire", t):
+            return "fiche"
+        if re.search(r"description\s+de\s+l.op[eé]ration", t):
+            return "fiche"
+
+        # Autorisation — permit-specific vocabulary and structure
+        # NOTE: "permis" and "autorisation" appear in fiche text too, so we
+        # require more specific phrases like "PERMIS DE CONSTRUIRE" heading
+        if re.search(r"permis\s+de\s+construire|d[eé]claration\s+pr[eé]alable", t):
+            return "autorisation"
+        if re.search(r"arrêt[eé]\s*\s*:", t):
+            return "autorisation"
+        if re.search(r"article\s+1\s*\s*:", t):
             return "autorisation"
 
+        # Default — fiche is the most common document in this workflow
         return "fiche"
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # FICHE
-    # ══════════════════════════════════════════════════════════════════════════
 
     def _extract_fiche(self, pdf_path: str, text: str, is_scanned: bool = False) -> dict:
         norm = re.sub(r"\s+", " ", text)
         m    = self.FICHE_PERMIT.search(norm)
+        ref  = m.group(1).replace(" ", "").upper() if m else None
+        # Fallback: bare ref without PC/PA/DP prefix typed by consultant
+        if not ref:
+            m2 = self.FICHE_PERMIT_BARE.search(norm)
+            if m2:
+                candidate = re.sub(r"[^A-Z0-9]", "", m2.group(1).upper())
+                # Accept if it looks like a valid ref body (10-13 alphanum chars)
+                if 10 <= len(candidate) <= 13:
+                    ref = candidate
         out  = {
-            "ref_urbanisme": m.group(1).replace(" ", "").upper() if m else None,
+            "ref_urbanisme": ref,
             "dlpi":          None,
         }
         m = self.FICHE_DLPI.search(norm)
         if m:
             out["dlpi"] = re.sub(r"\s*/\s*", "/", m.group(1))
 
-        # ── Layer 0.5: HIGH-PRIORITY PAIR EXTRACTION (before table parsing) ────
-        # If we find a confident logements/locaux phrase, mark it as trusted source
         compact = re.sub(r"\s+", " ", text)
-        pair = self._extract_logements_locaux_pair(compact)
-        pair_found = pair is not None
-        if pair:
-            out["nb_logements_residentiels"], out["nb_locaux_pros"] = pair
-            logger.info("High-priority pair found: %d logements, %d locaux", pair[0], pair[1])
 
-        # ── Layer 1: pdfplumber structured table ──────────────────────────────
+        # ── Layer 1: pdfplumber structured table (AUTHORITATIVE) ─────────────
+        # The detail table (Table 2) is always checked first because it has
+        # explicit column headers — "Nb de logts résidentiel" and
+        # "Nb de locaux professionnel" — that leave no ambiguity.
+        # Pair extraction (summary text) runs AFTER and only fills gaps.
         if Path(pdf_path).suffix.lower() == ".pdf":
             table_result = self._extract_fiche_table(pdf_path)
-            # Only use table results if pair extraction wasn't already successful
-            if not pair_found:
-                out.update(table_result)
-            else:
-                # Merge address only (never override count fields from pair)
-                if table_result.get("adresse") and not out.get("adresse"):
-                    out["adresse"] = table_result["adresse"]
+            out.update({k: v for k, v in table_result.items() if v is not None})
+
+        # ── Layer 1.5: pair extraction — fills gaps left by table ─────────────
+        # "62 logements et 5 locaux profs" — explicit combined summary phrase.
+        # Only fires for fields the table did NOT populate.
+        pair_found = False
+        if out.get("nb_logements_residentiels") is None or out.get("nb_locaux_pros") is None:
+            pair = self._extract_logements_locaux_pair(compact)
+            if pair:
+                pair_found = True
+                if out.get("nb_logements_residentiels") is None:
+                    out["nb_logements_residentiels"] = pair[0]
+                if out.get("nb_locaux_pros") is None:
+                    out["nb_locaux_pros"] = pair[1]
+                logger.info("Pair filled gaps: res=%s pro=%s",
+                            out.get("nb_logements_residentiels"), out.get("nb_locaux_pros"))
 
         # ── Layer 2: regex pattern matching on digital text ────────────────────
-        if not pair_found:
+        if not pair_found and out.get("nb_logements_residentiels") is None and out.get("nb_locaux_pros") is None:
             self._fill_fiche_counts(out, compact)
+
+        # Explicit "Nb de cellules" value is authoritative for professional units.
+        explicit_pro = self._extract_explicit_cellules_count(compact)
+        if explicit_pro is not None:
+            out["nb_locaux_pros"] = explicit_pro
+            # If residential was only inferred from an ambiguous total and equals
+            # the explicit pro count, clear it so later layers can recover it.
+            if out.get("nb_logements_residentiels") == explicit_pro:
+                has_explicit_res = re.search(
+                    r"\bnb\s*(?:de\s*)?(?:logts?|logements?)\s*(?:r[ée]sidentiels?)?\s*[:=]\s*\d+\b",
+                    compact,
+                    re.I,
+                )
+                if not has_explicit_res:
+                    out["nb_logements_residentiels"] = None
 
         # ── Layer 3: OCR image fallback — handles screenshot tables, bad scan,
         #    cropped or non-standard templates where pdfplumber finds nothing ──
@@ -290,10 +414,14 @@ class OrangeExtractor:
         # Trigger OCR refinement if:
         # 1. We found any counts but they include suspicious values (0/1 pro with many logements)
         # 2. Or counts are completely missing
+        # Suspicious only when res >> pro AND we had no table evidence for pro.
+        # pro=0 from the detail table is VALID (the building has 0 pro units).
+        # pro=0 from regex/pair on a large building (res≥10) is suspicious.
         suspicious_pro_count = (
-            pair_found is False and  # Was pair extraction even attempted?
-            out.get("nb_locaux_pros") in (0, 1) and
-            (out.get("nb_logements_residentiels") or 0) >= 5  # Lower threshold from 10 to 5
+            pair_found is False
+            and out.get("nb_locaux_pros") == 0
+            and (out.get("nb_logements_residentiels") or 0) >= 10
+            and not out.get("_pro_from_table", False)  # set below when table found pro col
         )
         if counts_missing or suspicious_pro_count:
             # Scanned files already use OCR in _get_text, so only re-OCR digital files.
@@ -313,10 +441,23 @@ class OrangeExtractor:
             if not pair:  # If aggressive extraction still fails, try pattern matching
                 self._fill_fiche_counts(out, source_text)
 
+            has_explicit_numeric_counts = (
+                pair is not None
+                or bool(
+                    re.search(
+                        r"\b(?:nb\s*(?:de\s*)?(?:logts?|logements?|locaux?|cellules?)\s*[:=]?\s*\d+|\d{1,4}\s*logements?.{0,20}\d{1,4}\s*(?:locaux|cellules?))\b",
+                        source_text,
+                        re.I,
+                    )
+                )
+            )
             el_results = self._extract_el_columns(source_text)
-            for key in ["nb_logements_residentiels", "nb_locaux_pros"]:
-                if out.get(key) is None and el_results.get(key) is not None:
-                    out[key] = el_results[key]
+            # EL fields are booleans, not hard counts. Use only as weak fallback
+            # when no explicit numeric counts were found in the text.
+            if not has_explicit_numeric_counts:
+                for key in ["nb_logements_residentiels", "nb_locaux_pros"]:
+                    if out.get(key) is None and el_results.get(key) is not None:
+                        out[key] = el_results[key]
 
             still_missing = (
                 out.get("nb_logements_residentiels") is None or
@@ -328,23 +469,37 @@ class OrangeExtractor:
                     if out.get(f) is None
                 ]
                 llm_out = self._llm_extract(
-                    text=source_text[:3000],
+                    text=source_text[:1500],
                     fields=llm_fields,
                     instructions=(
-                        "This is a French real estate form (Fiche de renseignement). "
-                        "The table lists properties with columns for residential units "
-                        "(logements résidentiels) and professional premises (locaux pros). "
-                        "Extract the TOTAL count across ALL rows for each field. "
-                        "nb_logements_residentiels: total number of residential units (integer). "
-                        "nb_locaux_pros: total number of professional premises (integer). "
-                        "Use null — NOT 0 — if you genuinely cannot find the value."
-                    ),
+                        """### ROLE
+You are a French Urbanism Data Auditor specializing in Orange "Fiche de Renseignement" forms. You have high attention to detail and never confuse land lots with housing units.
+
+### ANALYSIS RULES
+1. **Identify the Building Table**: Look for rows containing "RUE", "Bâtiment", or "Commune". 
+2. **Extract with Logic**:
+   - **Residential Units (nb_logements_residentiels)**: Look for "Nb", "EL résidentiel", or "Logements". If the text says "62 logements et 5 locaux", the answer is 62.
+   - **Professional Units (nb_locaux_pros)**: Look for "Nb de cellules", "Locaux pros", or "Commerces". If the text says "1 CELLULE", the answer is 1.
+3. **DO NOT CONFUSE**:
+   - **Land vs. Housing**: "Nb total de lots" in the "Lotissement" section refers to land. Ignore it unless it specifically says "logements".
+   - **Booleans vs. Counts**: "EL Résidentiel: OUI" is a checkbox, not a number. Do not extract "1" just because you see "OUI".
+   - **The "Total" Trap**: If the document says "Total: 67" but specifies "62 logts + 5 locaux", you MUST return 62 and 5 separately.
+
+### WORKSPACE (Chain of Thought)
+Before providing the JSON, identify each building/row you found in the text and the numbers associated with them.
+
+### OUTPUT FORMAT
+Return ONLY a JSON object. No prose. No markdown blocks.
+{
+  "evidence": "List the buildings and counts found here to justify your math",
+  "nb_logements_residentiels": <integer or null>,
+  "nb_locaux_pros": <integer or null>
+}
+                    """),
                 )
                 for key in llm_fields:
                     if llm_out.get(key) is not None:
                         out[key] = llm_out[key]
-                if llm_out:
-                    out["llm_used"] = True
 
         # ── Layer 4: infer pro units from declared total ───────────────────────
         if out.get("nb_locaux_pros") is None and out.get("nb_logements_residentiels") is not None:
@@ -367,11 +522,12 @@ class OrangeExtractor:
         """
         try:
             pages_text = []
+            ocr_config = self._build_ocr_config(psm_default=6)
             with pdfplumber.open(pdf_path) as pdf:
                 for page in pdf.pages:
                     img = self._prepare_ocr_image(page.to_image(resolution=300).original)
                     pages_text.append(
-                        self._ocr_to_string(img, config="--psm 6")
+                        self._ocr_to_string(img, config=ocr_config)
                     )
             result = "\n".join(pages_text).strip()
             if result:
@@ -393,26 +549,55 @@ class OrangeExtractor:
         for table in all_tables:
             if not table or len(table) < 2:
                 continue
-            header = [str(c or "").lower().strip() for c in table[0]]
+            # Collapse internal newlines — pdfplumber sometimes splits
+            # multi-line header cells with "\n" inside the string.
+            header = [re.sub(r"\s+", " ", str(c or "")).lower().strip()
+                      for c in table[0]]
             col = {}
             for i, cell in enumerate(header):
+                is_ambiguous_total = (
+                    "nb total" in cell
+                    and "logement" in cell
+                    and "locaux" in cell
+                )
                 # Residential: match "résidentiel/residentiel" that isn't also pro
                 if (
-                    ("résidentiel" in cell or "residentiel" in cell)
+                    not is_ambiguous_total
+                    and ("résidentiel" in cell or "residentiel" in cell)
                     and not ("professionnel" in cell or "pro" in cell)
+                    and not ("locaux" in cell or "lots" in cell)
                     and not re.match(r"^el\b", cell)  # Exclude EL (boolean) column
                 ):
                     col["nb_resid"] = i
                 # Professional: numeric count columns only (avoid EL yes/no columns)
-                # Must have both "locaux"/"cellule" AND ("pro"/"professionnel")
+                # Prefer explicit professional headers or any "cellule" count header.
                 elif (
-                    ("locaux" in cell or "cellule" in cell)
-                    and ("professionnel" in cell or "pro" in cell)
+                    not is_ambiguous_total
+                    and (
+                        "cellule" in cell
+                        or (("locaux" in cell) and ("pro" in cell or "professionnel" in cell))
+                    )
                     and not re.match(r"^el\b", cell)  # Exclude EL (boolean) column
                 ):
                     col["nb_pro"] = i
                 elif any(k in cell for k in ["adresse", "voie", "rue", "address"]):
                     col["adresse"] = i
+
+            # Bare "Nb" column mapping:
+            # Case A: "Nb de cellules" is present → "Nb" = residential (existing logic)
+            # Case B: No pro column at all but table has structural markers
+            #         (commune/synergie/voie/nom/dlpi) → "Nb" = residential.
+            #         This covers single-unit fiches (PDF3 template) where
+            #         pro column is simply absent.
+            _STRUCTURAL_MARKERS = {"commune", "synergie", "voie", "nom",
+                                   "dlpi", "numéro voie", "numero voie",
+                                   "complément n° voie", "complement n voie"}
+            _has_structural = len(set(header) & _STRUCTURAL_MARKERS) >= 2
+            if "nb_resid" not in col and ("nb_pro" in col or _has_structural):
+                for i, cell in enumerate(header):
+                    if re.fullmatch(r"nb", cell):
+                        col["nb_resid"] = i
+                        break
 
             if "nb_resid" not in col and "nb_pro" not in col:
                 continue
@@ -449,8 +634,21 @@ class OrangeExtractor:
                 result["nb_logements_residentiels"] = total_resid
             if found_pro:
                 result["nb_locaux_pros"] = total_pro
+                result["_pro_from_table"] = True   # suppress false suspicious flag
+            elif "nb_pro" in col:
+                # Pro column existed but all rows were empty/None → treat as 0
+                result["nb_locaux_pros"] = 0
+                result["_pro_from_table"] = True
 
-            if result["nb_logements_residentiels"] is not None or result["nb_locaux_pros"] is not None:
+            # Trust this table immediately when it contains a professional column,
+            # or when it is an address-based detail table with both count columns.
+            if result["nb_locaux_pros"] is not None:
+                return result
+            if (
+                result["nb_logements_residentiels"] is not None
+                and result["adresse"]
+                and "nb_pro" in col
+            ):
                 return result
 
         # Pass 2 — generic header fallback, also summing all rows
@@ -484,13 +682,6 @@ class OrangeExtractor:
             for rkey, total in totals.items():
                 result[rkey] = total
 
-        # Pass 3 — last resort: scan first table as flat text
-        if result["nb_logements_residentiels"] is None and all_tables:
-            flat = " ".join(str(c or "") for row in all_tables[0] for c in row)
-            m    = re.search(r"Nb\s+total\s+de\s+logements[^\d:]*[:=]\s*(\d+)(?:\s|$|[^\w])", flat, re.I)
-            if m:
-                result["nb_logements_residentiels"] = int(m.group(1))
-
         return result
 
     def _extract_el_columns(self, text: str) -> dict:
@@ -521,27 +712,31 @@ class OrangeExtractor:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _extract_au_ref(self, text: str) -> str | None:
+        """
+        Extract and clean permit reference from autorisation text.
+        Handles spaced formats, 2-digit depts, OCR noise, and Z→2 misreads.
+        """
         hit = self.AU_PERMIT.search(text)
         if hit:
-            return re.sub(r"[^A-Z0-9]", "", hit.group(1).upper())
+            return self._clean_permit_ref(hit.group(1))
 
+        # Fallback: scan lines with permit keywords
         for line in text.splitlines():
-            if not re.search(r"dossier|permis|arr[êe]t", line, re.I):
+            if not re.search(r"dossier|permis|arr[êe]t|n[°o]\s*p[cad]", line, re.I):
                 continue
             cand = self.AU_PERMIT_FALLBACK.search(line)
             if cand:
-                cleaned = re.sub(r"[^A-Z0-9]", "", cand.group(0).upper())
-                if re.match(r"^(PC|PA|DP|CU)[0-9A-Z]{8,}$", cleaned):
+                cleaned = self._clean_permit_ref(cand.group(0))
+                if re.match(r"^(PC|PA|DP|CU)[0-9A-Z]{13}$", cleaned):
                     return cleaned
         return None
 
     def _extract_autorisation(self, text: str) -> dict:
         out = {
             "ref_urbanisme": self._extract_au_ref(text),
-            "llm_used":      True,
         }
-        out["adresse"] = self._llm_extract(
-            text=text[:2000],
+        llm_out = self._llm_extract(
+            text=text[:1200],
             fields=["adresse"],
             instructions=(
                 "Extract the project address — the physical location of the building or land "
@@ -549,7 +744,8 @@ class OrangeExtractor:
                 "Do NOT return the applicant's home address."
                 "Extract number of logements if you can find it with certainty, but do NOT guess or infer from context — we just want what is explicitly stated in the text. "
             ),
-        ).get("adresse")
+        )
+        out["adresse"] = llm_out.get("adresse")
         return out
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -575,22 +771,19 @@ class OrangeExtractor:
             text[-3000:],   # fallback: last 3000 chars of unsplit text
         )
 
-        return {
-            **self._llm_extract(
-                text=mandat_chunk[:3000],
-                fields=fields,
-                instructions=(
-                    "This is a French FTTH mandate (Mandat de signature). "
-                    "Orange is always the SECOND party — the \'Mandataire\'. "
-                    "Extract ONLY the Orange representative\'s details — NOT the client (Mandant). "
-                    "orange_representant_nom: full name. "
-                    "orange_representant_fonction: job title at Orange. "
-                    "orange_representant_mobile: phone number. "
-                    "orange_representant_email: @orange.com email."
-                ),
+        llm_out = self._llm_extract(
+            text=mandat_chunk[:1600],
+            fields=fields,
+            instructions=(
+                "This is a French FTTH mandate (Mandat de signature). "
+                "Orange is always the SECOND party — the \'Mandataire\'. "
+                "Extract ONLY the Orange representative\'s details — NOT the client (Mandant). "
+                "orange_representant_nom: full name. "
+                "orange_representant_mobile: phone number. "
+                "orange_representant_email: @orange.com email."
             ),
-            "llm_used": True,
-        }
+        )
+        return llm_out
 
     # ══════════════════════════════════════════════════════════════════════════
     # LLM
@@ -603,19 +796,31 @@ class OrangeExtractor:
             f"You are a data extraction expert for French real estate documents.\n"
             f"{instructions}\n\n"
             f"Return ONLY a valid JSON object with these exact keys: {json.dumps(fields)}\n"
-            f"return 0 for any field you cannot find with certainty.\n"
+            f"For missing values: return 0 for numeric count fields and null for other fields.\n"
             f"No markdown, no explanation, no text outside the JSON.\n\n"
             f"Document text:\n{text}"
         )
+        model_name = os.getenv("OLLAMA_MODEL", "qwen2.5:1.5b")
+        options = {
+            "temperature": 0,
+            "top_k": 10,
+            "top_p": 0.9,
+            # CPU: smaller context = faster prefill
+            "num_ctx": 1024,
+            # Use physical cores only (avoid hyper-threading contention)
+            "num_thread": int(os.getenv("OLLAMA_THREADS",
+                              str(max(1, (os.cpu_count() or 4) // 2)))),
+        }
+
         try:
-            raw = ollama.generate(model="qwen2.5:7b", prompt=prompt, options={"temperature": 0, "top_k": 10}).get("response", "")
+            raw = ollama.generate(model=model_name, prompt=prompt, options=options).get("response", "")
             start = raw.find("{")
             end   = raw.rfind("}") + 1
             if start == -1 or end <= 0:
                 logger.warning("LLM returned no JSON block")
                 return {}
             payload = json.loads(raw[start:end])
-            return {f: payload.get(f) for f in fields}
+            return {f: self._coerce_field_value(f, payload.get(f)) for f in fields}
         except json.JSONDecodeError as e:
             logger.warning("LLM JSON parse error: %s", e)
             return {}
@@ -628,8 +833,20 @@ class OrangeExtractor:
     # ══════════════════════════════════════════════════════════════════════════
 
     # ── Per-type result schemas — only relevant fields, no cross-type nulls ────
-    _BASE = {"document_type": None, "scanned": False, "llm_used": False,
-             "error": None, "present": False}
+    _BASE = {"document_type": None, "present": False}
+
+    _INT_FIELDS = {
+        "nb_logements_residentiels",
+        "nb_locaux_pros",
+    }
+    _STR_FIELDS = {
+        "ref_urbanisme",
+        "dlpi",
+        "adresse",
+        "orange_representant_nom",
+        "orange_representant_mobile",
+        "orange_representant_email",
+    }
 
     _SCHEMA: dict[str, dict] = {
         "fiche": {
@@ -652,6 +869,7 @@ class OrangeExtractor:
         "plan_situation": {},
         "plan_masse":     {},
         "certificat":     {},
+        "unknown":        {},
     }
 
     def _empty_result(self, doc_type: str | None = None) -> dict[str, Any]:
@@ -664,6 +882,83 @@ class OrangeExtractor:
             base.update(self._SCHEMA[doc_type])
         return base
 
+    def _coerce_field_value(self, field: str, value: Any) -> Any:
+        """Normalize LLM values to expected per-field types."""
+        if field in self._INT_FIELDS:
+            if value is None:
+                return 0
+            parsed = self._safe_int(value)
+            return parsed if parsed is not None else 0
+        if value is None:
+            return None
+        if field in self._STR_FIELDS:
+            text = str(value).strip()
+            if not text or text in {"0", "null", "none", "n/a", "na"}:
+                return None
+            return text
+        return value
+
+    def _post_validate_result(self, result: dict[str, Any]) -> None:
+        """Apply lightweight field normalization and validation in-place."""
+        result.pop("_pro_from_table", None)  # remove internal flag
+
+        # Basic type/value validation
+        for field in self._INT_FIELDS:
+            if field not in result:
+                continue
+            parsed = self._safe_int(result.get(field))
+            if parsed is None:
+                result[field] = 0
+                continue
+            if parsed < 0:
+                result[field] = 0
+                continue
+            result[field] = parsed
+
+        ref = result.get("ref_urbanisme")
+        if ref is not None:
+            clean_ref = self._clean_permit_ref(str(ref))
+            if re.match(r"^(PC|PA|DP|CU)[0-9A-Z]{13}$", clean_ref):
+                result["ref_urbanisme"] = clean_ref
+            else:
+                result["ref_urbanisme"] = None
+
+        dlpi = result.get("dlpi")
+        if dlpi is not None:
+            dlpi_norm = re.sub(r"\s*/\s*", "/", str(dlpi).strip())
+            if re.match(r"^\d{1,2}/\d{1,2}/\d{4}$", dlpi_norm):
+                result["dlpi"] = dlpi_norm
+            else:
+                result["dlpi"] = None
+
+        email = result.get("orange_representant_email")
+        if email is not None:
+            email_text = str(email).strip()
+            if re.match(r"^[^@\s]+@orange\.com$", email_text, re.I):
+                result["orange_representant_email"] = email_text
+            else:
+                result["orange_representant_email"] = None
+
+        mobile = result.get("orange_representant_mobile")
+        if mobile is not None:
+            mobile_text = str(mobile).strip()
+            digits = re.sub(r"\D", "", mobile_text)
+            if 10 <= len(digits) <= 15:
+                result["orange_representant_mobile"] = mobile_text
+            else:
+                result["orange_representant_mobile"] = None
+
+        for field in self._STR_FIELDS:
+            if field not in result:
+                continue
+            if result.get(field) is None:
+                continue
+            text = str(result[field]).strip()
+            if not text:
+                result[field] = None
+            else:
+                result[field] = text
+
     def _safe_int(self, value: Any) -> int | None:
         s = re.sub(r"[^0-9\-]", "", str(value or "").strip())
         try:
@@ -671,72 +966,75 @@ class OrangeExtractor:
         except ValueError:
             return None
 
-    def _detect_tesseract_languages(self) -> set[str]:
-        """Read installed OCR languages once and cache in the extractor instance."""
+    def _build_ocr_config(self, psm_default: int = 6) -> str:
+        """Build OCR config with environment overrides for fast runtime tuning."""
         try:
-            langs = set(pytesseract.get_languages(config=""))
-            logger.info("Tesseract languages detected: %s", ", ".join(sorted(langs)) or "none")
-            return langs
-        except Exception as e:
-            logger.warning("Could not query Tesseract languages: %s", e)
-            return set()
-
-    def _ocr_lang_candidates(self) -> list[str | None]:
-        """Prefer French, then English, then default engine language."""
-        langs = self._tesseract_langs
-        candidates: list[str | None] = []
-        if {"fra", "eng"}.issubset(langs):
-            candidates.append("fra+eng")
-        if "fra" in langs:
-            candidates.append("fra")
-        if "eng" in langs:
-            candidates.append("eng")
-        candidates.append(None)
-        return candidates
+            psm = int(os.getenv("OCR_PSM", str(psm_default)))
+        except ValueError:
+            psm = psm_default
+        try:
+            oem = int(os.getenv("OCR_OEM", "1"))
+        except ValueError:
+            oem = 1
+        # Clamp to common valid ranges to avoid passing invalid Tesseract args.
+        psm = psm if 0 <= psm <= 13 else psm_default
+        oem = oem if 0 <= oem <= 3 else 1
+        return f"--oem {oem} --psm {psm}"
 
     def _ocr_to_string(self, image: Image.Image, config: str | None = None) -> str:
-        """Run OCR with language fallbacks so missing traineddata does not crash extraction."""
-        for lang in self._ocr_lang_candidates():
-            kwargs: dict[str, Any] = {}
-            if lang:
-                kwargs["lang"] = lang
-            if config:
-                kwargs["config"] = config
-            try:
-                return pytesseract.image_to_string(image, **kwargs)
-            except pytesseract.TesseractError as e:
-                logger.warning("OCR failed for lang=%s (%s)", lang or "default", e)
-            except Exception as e:
-                logger.warning("OCR unexpected failure for lang=%s (%s)", lang or "default", e)
+        """Run OCR in French only (fra)."""
+        if config is None:
+            config = self._build_ocr_config(psm_default=6)
+        kwargs: dict[str, Any] = {"lang": self._ocr_lang}
+        if config:
+            kwargs["config"] = config
+        try:
+            return pytesseract.image_to_string(image, **kwargs)
+        except pytesseract.TesseractError as e:
+            logger.warning("OCR failed for lang=%s (%s)", self._ocr_lang, e)
+        except Exception as e:
+            logger.warning("OCR unexpected failure for lang=%s (%s)", self._ocr_lang, e)
         return ""
 
     def _prepare_ocr_image(self, image: Image.Image) -> Image.Image:
-        """Normalize, auto-rotate, and binarize images before OCR."""
-        prepared = ImageOps.exif_transpose(image)
-        if prepared.mode not in ("L", "RGB"):
-            prepared = prepared.convert("RGB")
+        """
+        Preprocessing pipeline tuned for CPU-based OCR on French real-estate forms.
 
-        if prepared.mode != "L":
-            prepared = ImageOps.grayscale(prepared)
+        Order matters:
+          1. EXIF rotation first — work in correct orientation from the start
+          2. Greyscale conversion — all subsequent ops are single-channel
+          3. Upscale if small — Tesseract needs ≥150 px/char-height to be reliable
+          4. Auto-rotate via OSD — fix 90/180/270 degree scans
+          5. Contrast normalisation — pull weak ink/shadow into a usable range
+          6. Sauvola local binarization — handles uneven lighting & table borders
+             without blurring digits (avoids the MedianFilter+Sharpen trap that
+             smears thin strokes before thresholding)
+        """
+        # Step 1 — honour EXIF rotation embedded by scanners/phones
+        img = ImageOps.exif_transpose(image)
 
-        # Upscale small images so glyphs have more pixels to work with.
-        if min(prepared.size) < 1600:
-            prepared = prepared.resize(
-                (prepared.width * 2, prepared.height * 2),
+        # Step 2 — greyscale
+        if img.mode != "L":
+            img = img.convert("L")
+
+        # Step 3 — upscale small images (min dimension < 1800 px)
+        if min(img.size) < 1800:
+            scale = max(2, 1800 // min(img.size))
+            img = img.resize(
+                (img.width * scale, img.height * scale),
                 Image.Resampling.LANCZOS,
             )
 
-        prepared = ImageOps.autocontrast(prepared)
-        prepared = prepared.filter(ImageFilter.MedianFilter(size=3))
-        prepared = prepared.filter(ImageFilter.SHARPEN)
-        prepared = ImageEnhance.Sharpness(prepared).enhance(1.8)
-        prepared = ImageEnhance.Contrast(prepared).enhance(1.4)
+        # Step 4 — OSD auto-rotation (before heavy processing)
+        img = self._autorotate_for_ocr(img)
 
-        # Fix common 90/180/270 orientation issues before OCR.
-        prepared = self._autorotate_for_ocr(prepared)
+        # Step 5 — contrast normalisation (stretch histogram, no clipping)
+        img = ImageOps.autocontrast(img, cutoff=1)
 
-        # Adaptive thresholding preserves thin text better than a fixed cutoff.
-        return self._adaptive_binarize(prepared)
+        # Step 6 — Sauvola local binarization via numpy
+        #  Sauvola threshold: T = mean * (1 + k * (std/R - 1))
+        #  k=0.25, R=128  → aggressive enough for low-contrast forms
+        return self._sauvola_binarize(img)
 
     def _autorotate_for_ocr(self, image: Image.Image) -> Image.Image:
         """Use Tesseract OSD to rotate pages into a readable orientation."""
@@ -750,20 +1048,53 @@ class OrangeExtractor:
             logger.debug("OSD auto-rotation skipped: %s", e)
         return image
 
-    def _adaptive_binarize(self, gray: Image.Image) -> Image.Image:
-        """Apply local adaptive thresholding, with a safe global fallback."""
+    def _sauvola_binarize(self, gray: Image.Image, k: float = 0.25,
+                          window: int = 51, R: float = 128.0) -> Image.Image:
+        """
+        Sauvola local binarization — handles uneven illumination, shadow gradients,
+        and table-border interference without blurring digit strokes.
+
+        window: local neighbourhood size in pixels (odd number).
+                Larger → better for big text; 51px works well at 300 dpi.
+        k:      sensitivity (0.2–0.5); higher = more aggressive foreground capture.
+        R:      dynamic range of standard deviation (128 for 8-bit greyscale).
+
+        Falls back to Otsu-style global threshold on numpy failure.
+        """
         try:
-            local_bg = gray.filter(ImageFilter.GaussianBlur(radius=8))
-            binary = ImageMath.eval(
-                "convert(a > (b - offset), '1')",
-                a=gray,
-                b=local_bg,
-                offset=12,
-            )
-            return binary.convert("L")
+            if window < 3:
+                window = 3
+            if window % 2 == 0:
+                window += 1
+
+            arr = np.array(gray, dtype=np.float32)
+
+            # Reflect-pad then use integral images with an extra zero border,
+            # yielding true per-pixel local window sums in O(1).
+            pad = window // 2
+            padded = np.pad(arr, ((pad, pad), (pad, pad)), mode="reflect")
+            padded_sq = padded ** 2
+
+            ii = np.pad(padded, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
+            ii2 = np.pad(padded_sq, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
+
+            s = ii[window:, window:] - ii[:-window, window:] - ii[window:, :-window] + ii[:-window, :-window]
+            s2 = ii2[window:, window:] - ii2[:-window, window:] - ii2[window:, :-window] + ii2[:-window, :-window]
+
+            win_area = float(window * window)
+            mean = s / win_area
+            var  = np.maximum(s2 / win_area - mean ** 2, 0)
+            std  = np.sqrt(var)
+
+            threshold = mean * (1.0 + k * (std / R - 1.0))
+            binary = (arr >= threshold).astype(np.uint8) * 255
+            return Image.fromarray(binary, mode="L")
         except Exception as e:
-            logger.debug("Adaptive threshold fallback used: %s", e)
-            return gray.point(lambda p: 255 if p > 185 else 0)
+            logger.debug("Sauvola binarize fallback used: %s", e)
+            # Simple Otsu-style global fallback
+            arr = np.array(gray, dtype=np.uint8)
+            thr = int(arr.mean())
+            return Image.fromarray(np.where(arr >= thr, 255, 0).astype(np.uint8), mode="L")
 
     def _to_count(self, value: Any) -> int | None:
         v = str(value or "").strip().upper()
@@ -785,6 +1116,13 @@ class OrangeExtractor:
                 if parsed is not None:
                     out[key] = parsed
                     break
+
+    def _extract_explicit_cellules_count(self, text: str) -> int | None:
+        """Return explicit professional-unit count from 'Nb de cellules' labels."""
+        m = self.FICHE_NB_CELLULES.search(text)
+        if not m:
+            return None
+        return self._safe_int(m.group(1))
 
     def _extract_logements_locaux_pair(self, text: str) -> tuple[int, int] | None:
         """Extract logements and locaux pros using primary patterns."""
@@ -821,7 +1159,7 @@ class OrangeExtractor:
 
     def _find_table_header(self, table) -> int | None:
         addr_kw  = {"adresse", "bâtiment", "batiment"}
-        units_kw = {"résidentiel", "residentiel", "professionnel"}
+        units_kw = {"résidentiel", "residentiel", "professionnel", "locaux", "cellule", "nb de cellules"}
         for i, row in enumerate(table):
             if not row:
                 continue

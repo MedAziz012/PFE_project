@@ -266,12 +266,42 @@ class RulesEngine:
 
         return issues
 
-    @staticmethod
-    def _normalise_ref(ref: str | None) -> str | None:
-        """PC 085 250 25 00017 → PC0852502500017"""
+    # OCR commonly misreads the suffix letter (position 10) as a digit.
+    # Same map as OrangeExtractor._OCR_DIGIT_TO_LETTER.
+    _OCR_DIGIT_TO_LETTER = {"2": "Z", "8": "B", "0": "O", "1": "I", "6": "G", "5": "S"}
+
+    @classmethod
+    def _normalise_ref(cls, ref: str | None) -> str | None:
+        """
+        Normalise permit references for comparison — handles 3 real-world issues:
+
+        1. Spaces/dashes between groups: "PC 033 200 24 Z0041" → "PC03320024Z0041"
+        2. 2-digit dept (zero-pad):      "PC6448324B0041"      → "PC06448324B0041"
+        3. OCR noise suffix:             "PC06448324B0041ST"    → "PC06448324B0041"
+        4. OCR digit at suffix position: "PC03320024 20041"     → "PC03320024Z0041"
+           (Z misread as 2 — very common with Tesseract on scanned docs)
+
+        WHY this matters for comparison:
+        The fiche ref is extracted from a digital PDF (pdfplumber, perfect text).
+        The autorisation ref is extracted via OCR from a scan (Tesseract, imperfect).
+        Without normalization, identical refs like PC03320024Z0041 and PC0332002420041
+        are treated as different, incorrectly flagging the folder as INCOMPLET.
+        """
         if not ref:
             return None
-        return re.sub(r"\s+", "", ref).upper()
+        clean = re.sub(r"[^A-Z0-9]", "", ref.upper())
+        prefix = clean[:2] if len(clean) >= 2 else ""
+        if prefix in ("PC", "PA", "DP", "CU"):
+            if len(clean) == 14:           # 2-digit dept — zero-pad
+                clean = clean[:2] + "0" + clean[2:]
+            if len(clean) > 15:            # OCR noise — truncate to 15
+                clean = clean[:15]
+            # Fix OCR digit at suffix letter position (always index 10)
+            if len(clean) == 15 and clean[10].isdigit():
+                letter = cls._OCR_DIGIT_TO_LETTER.get(clean[10])
+                if letter:
+                    clean = clean[:10] + letter + clean[11:]
+        return clean
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -323,7 +353,8 @@ class LLMReasoner:
             return self._template_reasons(issues)
 
     def _llm_write_reasons(self, issues: list[Issue]) -> list[str]:
-        import ollama
+        import os
+        from openai import OpenAI
 
         issue_lines = []
         for issue in issues:
@@ -349,9 +380,16 @@ Problèmes ({len(issues)}):
 Format attendu (exactement {len(issues)} entrées):
 {json.dumps(["Raison " + str(i+1) for i in range(len(issues))])}"""
 
-        resp  = ollama.generate(model="llama3", prompt=prompt,
-                                options={"temperature": 0, "top_k": 10})
-        raw   = resp.get("response", "")
+        client = OpenAI(
+            api_key=os.environ["GROQ_API_KEY"],
+            base_url="https://api.groq.com/openai/v1",
+        )
+        chat = client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        raw   = chat.choices[0].message.content or ""
         start = raw.find("[")
         end   = raw.rfind("]") + 1
 
