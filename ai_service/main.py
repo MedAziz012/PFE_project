@@ -9,12 +9,8 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, RedirectResponse, Response
-
-try:
-    from ai_service.extractor import OrangeExtractor
-except ModuleNotFoundError:
-    from extractor import OrangeExtractor
-from recommendation_engine import RecommendationEngine, FolderDocuments
+from extractor import OrangeExtractor
+from .recommendation_engine import RecommendationEngine, FolderDocuments
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
