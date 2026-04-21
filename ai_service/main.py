@@ -10,7 +10,10 @@ from typing import Any, Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
-from extractor import OrangeExtractor
+try:
+    from ai_service.extractor import OrangeExtractor
+except ModuleNotFoundError:
+    from extractor import OrangeExtractor
 from recommendation_engine import RecommendationEngine, FolderDocuments
 
 logging.basicConfig(
@@ -37,7 +40,7 @@ PRESENCE_MAP = {
 }
 
 _EXPECTED_FIELDS = {
-    "fiche":        ["ref_urbanisme", "dlpi", "adresse", "nb_logements_residentiels", "nb_locaux_pros"],
+    "fiche":        ["ref_urbanisme", "dlpi", "adresse", "nb_logements_residentiels", "nb_locaux_pros","nb_lots","nb_macrolots"],
     "autorisation": ["ref_urbanisme", "adresse"],
     "mandat":       ["orange_representant_nom", "orange_representant_mobile", "orange_representant_email"],
 }
@@ -56,7 +59,7 @@ def favicon():
 async def _read_and_validate(slot_name: str, upload: UploadFile) -> tuple[str, str, bytes]:
     filename = Path(upload.filename or slot_name).name
     if Path(filename).suffix.lower() not in ALLOWED_SUFFIXES:
-        raise HTTPException(400, f"'{slot_name}': only PDF/PNG/JPG/JPEG/WEBP accepted; got '{filename}'.")
+        raise HTTPException(400, f"'{slot_name}': only PDF/PNG accepted; got '{filename}'.")
     content = await upload.read()
     size = len(content)
     if not size:
@@ -111,7 +114,7 @@ async def analyze_batch(
 # A failure = document is present but the extractor returned None for that field.
 _EXPECTED_FIELDS: dict[str, list[str]] = {
     "fiche":        ["ref_urbanisme", "dlpi", "adresse",
-                     "nb_logements_residentiels", "nb_locaux_pros"],
+                     "nb_logements_residentiels", "nb_locaux_pros", "nb_lots","nb_macrolots"],
     "autorisation": ["ref_urbanisme", "adresse"],
     "mandat":       ["orange_representant_nom",
                      "orange_representant_mobile", "orange_representant_email"],

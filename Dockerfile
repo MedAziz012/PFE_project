@@ -20,4 +20,5 @@ COPY . .
 # 6. Start the app
 # Note: If your FastAPI app is inside ai_service/main.py, 
 # change the path to: ai_service.main:app
-CMD ["uvicorn", "ai_service.main:app", "--host", "0.0.0.0", "--port", "8080"]
+# This adds the current directory to the PYTHONPATH so it can find 'extractor'
+CMD ["sh", "-c", "PYTHONPATH=. uvicorn ai_service.main:app --host 0.0.0.0 --port 10000"]
