@@ -21,4 +21,5 @@ COPY . .
 # Note: If your FastAPI app is inside ai_service/main.py, 
 # change the path to: ai_service.main:app
 # This adds the current directory to the PYTHONPATH so it can find 'extractor'
-CMD ["sh", "-c", "PYTHONPATH=.:ai_service uvicorn ai_service.main:app --host 0.0.0.0 --port 10000"]
+# We add --timeout-keep-alive 120 to give the OCR more time
+CMD ["sh", "-c", "PYTHONPATH=.:ai_service uvicorn ai_service.main:app --host 0.0.0.0 --port 10000 --timeout-keep-alive 120"]
